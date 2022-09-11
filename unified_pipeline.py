@@ -9,6 +9,7 @@ from diffusers import AutoencoderKL, DDIMScheduler, DiffusionPipeline, PNDMSched
 
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 from fastprogress import progress_bar, master_bar
+from delegation import delegates
 
 def preprocess_image(image):
     if isinstance(image,torch.Tensor) or image is None: return image
@@ -34,7 +35,7 @@ def preprocess_mask(mask):
     mask = torch.from_numpy(mask)
     return mask
 
-class CoolStableDiffusionPipeline(DiffusionPipeline):
+class UnifiedStableDiffusionPipeline(DiffusionPipeline):
     def __init__(
         self,
         vae: AutoencoderKL,
@@ -56,21 +57,21 @@ class CoolStableDiffusionPipeline(DiffusionPipeline):
         )
 
     @torch.no_grad()
-    def __call__(
+    def generate(
         self,
         prompt: Union[str, List[str]],
         height: Optional[int] = 512,
         width: Optional[int] = 512,
-        latents = None,
-        initial_image = None,
+        latents: Optional[torch.FloatTensor] = None,
+        img = None,
         strength: float = 0.8,
-        num_inference_steps: Optional[int] = 50,
+        steps: Optional[int] = 50,
         guidance_scale: Optional[float] = 7.5,
-        eta: Optional[float] = 0.0,
-        generator: Optional[torch.Generator] = None,
-        output_type: Optional[str] = "pil",
-        masterbar: Optional[master_bar] = None
+        mb: Optional[master_bar] = None
     ):
+        eta = 0.0
+        generator = None
+        output_type = "pil"
 
         if isinstance(prompt, str):
             batch_size = 1
@@ -79,7 +80,7 @@ class CoolStableDiffusionPipeline(DiffusionPipeline):
         else:
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
         
-        initial_image = preprocess_image(initial_image) # ARREGLA ESTO!!!!
+        img = preprocess_image(img)
         
         # set timesteps
         accepts_offset = "offset" in set(inspect.signature(self.scheduler.set_timesteps).parameters.keys())
@@ -89,20 +90,20 @@ class CoolStableDiffusionPipeline(DiffusionPipeline):
             offset = 1
             extra_set_kwargs["offset"] = 1
 
-        self.scheduler.set_timesteps(num_inference_steps, **extra_set_kwargs)
-        init_timestep = num_inference_steps
+        self.scheduler.set_timesteps(steps, **extra_set_kwargs)
+        init_timestep = steps
         
-        if initial_image is not None:
+        if img is not None:
             # encode the init image into latents and scale the latents
-            latents = self.vae.encode(initial_image.to(self.device)).sample()
+            latents = self.vae.encode(img.to(self.device)).sample()
             latents = 0.18215 * latents
 
             # prepare latents noise to latents
             latents = torch.cat([latents] * batch_size)
 
             # get the original timestep using init_timestep
-            init_timestep = int(num_inference_steps * strength) + offset
-            init_timestep = min(init_timestep, num_inference_steps)
+            init_timestep = int(steps * strength) + offset
+            init_timestep = min(init_timestep, steps)
             timesteps = self.scheduler.timesteps[-init_timestep]
             timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long, device=self.device)
 
@@ -157,9 +158,9 @@ class CoolStableDiffusionPipeline(DiffusionPipeline):
             extra_step_kwargs["eta"] = eta
 
         latents = latents
-        t_start = max(num_inference_steps - init_timestep + offset, 0)
+        t_start = max(steps - init_timestep + offset, 0)
         total = len(self.scheduler.timesteps[t_start:])
-        for i, t in progress_bar(enumerate(self.scheduler.timesteps[t_start:]),total=total,parent=masterbar):
+        for i, t in progress_bar(enumerate(self.scheduler.timesteps[t_start:]),total=total,parent=mb):
             # expand the latents if we are doing classifier free guidance
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
@@ -191,16 +192,17 @@ class CoolStableDiffusionPipeline(DiffusionPipeline):
     def inpaint(
         self,
         prompt: Union[str, List[str]],
-        init_image: Union[torch.FloatTensor, PIL.Image.Image],
-        mask_image: Union[torch.FloatTensor, PIL.Image.Image],
+        img: Union[torch.FloatTensor, PIL.Image.Image],
+        mask: Union[torch.FloatTensor, PIL.Image.Image],
         strength: float = 0.8,
-        num_inference_steps: Optional[int] = 50,
+        steps: Optional[int] = 50,
         guidance_scale: Optional[float] = 7.5,
-        eta: Optional[float] = 0.0,
-        generator: Optional[torch.Generator] = None,
-        output_type: Optional[str] = "pil",
-        masterbar: Optional[master_bar] = None
+        mb: Optional[master_bar] = None
     ):
+        
+        eta = 0.0
+        generator = None
+        output_type = "pil"
 
         if isinstance(prompt, str):
             batch_size = 1
@@ -220,13 +222,13 @@ class CoolStableDiffusionPipeline(DiffusionPipeline):
             offset = 1
             extra_set_kwargs["offset"] = 1
 
-        self.scheduler.set_timesteps(num_inference_steps, **extra_set_kwargs)
+        self.scheduler.set_timesteps(steps, **extra_set_kwargs)
 
         # preprocess image
-        init_image = preprocess_image(init_image).to(self.device)
+        img = preprocess_image(img).to(self.device)
 
         # encode the init image into latents and scale the latents
-        init_latents = self.vae.encode(init_image).sample(generator=generator)
+        init_latents = self.vae.encode(img).sample(generator=generator)
         init_latents = 0.18215 * init_latents
 
         # Expand init_latents for batch_size
@@ -234,16 +236,16 @@ class CoolStableDiffusionPipeline(DiffusionPipeline):
         init_latents_orig = init_latents
 
         # preprocess mask
-        mask = preprocess_mask(mask_image).to(self.device)
+        mask = preprocess_mask(mask).to(self.device)
         mask = torch.cat([mask] * batch_size)
 
         # check sizes
         if not mask.shape == init_latents.shape:
-            raise ValueError("The mask and init_image should be the same size!")
+            raise ValueError("The mask and img should be the same size!")
 
         # get the original timestep using init_timestep
-        init_timestep = int(num_inference_steps * strength) + offset
-        init_timestep = min(init_timestep, num_inference_steps)
+        init_timestep = int(steps * strength) + offset
+        init_timestep = min(init_timestep, steps)
         timesteps = self.scheduler.timesteps[-init_timestep]
         timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long, device=self.device)
 
@@ -288,8 +290,8 @@ class CoolStableDiffusionPipeline(DiffusionPipeline):
             extra_step_kwargs["eta"] = eta
 
         latents = init_latents
-        t_start = max(num_inference_steps - init_timestep + offset, 0)
-        for t in progress_bar(self.scheduler.timesteps[t_start:],parent=masterbar):
+        t_start = max(steps - init_timestep + offset, 0)
+        for t in progress_bar(self.scheduler.timesteps[t_start:],parent=mb):
             # expand the latents if we are doing classifier free guidance
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
