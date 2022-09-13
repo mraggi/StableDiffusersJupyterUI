@@ -12,6 +12,7 @@ from pathlib import Path
 import gradio as gr
 from IPython.display import display
 from delegation import delegates
+from math import prod
 
 def image_grid(imgs):
     num = len(imgs)
@@ -69,7 +70,7 @@ class EnhancedGenerator:
         latents = I['latents']
         if prompt is None: prompt = I['prompt']
         
-        lats = [self._randlat(latents) for _ in range(num)]
+        lats = [self._randlat(latents,noise) for _ in range(num)]
         
         mb = master_bar(lats)
         X = [self.gen(prompt, latents=l, mb=mb,**kwargs) for l in mb]

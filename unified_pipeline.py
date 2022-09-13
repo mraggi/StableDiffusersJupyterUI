@@ -65,7 +65,7 @@ class UnifiedStableDiffusionPipeline(DiffusionPipeline):
         latents: Optional[torch.FloatTensor] = None,
         img = None,
         strength: float = 0.8,
-        steps: Optional[int] = 50,
+        steps: Optional[int] = 90,
         guidance_scale: Optional[float] = 7.5,
         mb: Optional[master_bar] = None
     ):
@@ -196,7 +196,7 @@ class UnifiedStableDiffusionPipeline(DiffusionPipeline):
         img: Union[torch.FloatTensor, PIL.Image.Image],
         mask: Union[torch.FloatTensor, PIL.Image.Image],
         strength: float = 0.8,
-        steps: Optional[int] = 50,
+        steps: Optional[int] = 90,
         guidance_scale: Optional[float] = 7.5,
         mb: Optional[master_bar] = None
     ):
