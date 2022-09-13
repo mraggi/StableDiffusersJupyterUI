@@ -55,13 +55,13 @@ class UnifiedStableDiffusionPipeline(DiffusionPipeline):
             scheduler=scheduler,
             feature_extractor=feature_extractor,
         )
+        self.height = 512
+        self.width = 512
 
     @torch.no_grad()
     def generate(
         self,
         prompt: Union[str, List[str]],
-        height: Optional[int] = 512,
-        width: Optional[int] = 512,
         latents: Optional[torch.FloatTensor] = None,
         img = None,
         strength: float = 0.8,
@@ -72,6 +72,7 @@ class UnifiedStableDiffusionPipeline(DiffusionPipeline):
         eta = 0.0
         generator = None
         output_type = "pil"
+        height, width = self.height, self.width
 
         if isinstance(prompt, str):
             batch_size = 1

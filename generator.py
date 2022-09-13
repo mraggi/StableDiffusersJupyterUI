@@ -13,15 +13,10 @@ import gradio as gr
 from IPython.display import display
 from delegation import delegates
 
-gr.close_all()
-
 def image_grid(imgs):
     num = len(imgs)
-    rows = floor(sqrt(num))
-    cols = ceil(num/rows)
-    if cols > 5:
-        cols = 5
-        rows = ceil(num/cols)
+    cols = min(4,ceil(sqrt(num)))
+    rows = ceil(num/cols)
     w, h = imgs[0].size
     grid = Image.new('RGB', size=(cols*w, rows*h))
     grid_w, grid_h = grid.size
@@ -31,7 +26,7 @@ def image_grid(imgs):
     return grid
 
 def random_string(n):
-    X = "abcdefghijklmnopqrstuvwxy0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    X = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     return "".join([random.choice(X) for _ in range(n)])
 
 def get_image_and_mask(img):
@@ -44,16 +39,18 @@ def get_image_and_mask(img):
 class EnhancedGenerator:
     def __init__(self, pipe, height=512, width=768, savedir = "saved"):
         self.pipe = pipe
-        self.h,self.w = height,width
+        self.height = height
+        self.width = width
         self.saved = []
         
         self.savedir = Path(savedir)
         (self.savedir/"pth").mkdir(exist_ok=True, parents=True)
-    
+        self.show_as_generated = False   
+        
     @delegates(UnifiedStableDiffusionPipeline.generate)
     def gen(self, prompt, **kwargs):
         with torch.autocast("cuda"):
-            P = self.pipe.generate(prompt, height=self.h, width=self.w, **kwargs)
+            P = self.pipe.generate(prompt, **kwargs)
         P['prompt'] = prompt
         P['index'] = len(self.saved)
         self.saved.append(P)
@@ -64,25 +61,26 @@ class EnhancedGenerator:
         mb = master_bar(range(num))
         X = [self.gen(prompt, mb=mb, **kwargs) for _ in mb]
         
-        return image_grid([self.with_prompt(x) for x in X])
+        return self._image_grid([self.with_prompt(x) for x in X])
     
     @delegates(UnifiedStableDiffusionPipeline.generate)
     def generate_variants(self, i, noise=0.4, num=6, prompt = None, **kwargs):
         I = self.saved[i]
         latents = I['latents']
         if prompt is None: prompt = I['prompt']
-        lats = [latents + torch.randn_like(latents)*noise for _ in range(num)]
-        lats = [(l-l.mean())/l.std() for l in lats]
+        
+        lats = [self._randlat(latents) for _ in range(num)]
+        
         mb = master_bar(lats)
         X = [self.gen(prompt, latents=l, mb=mb,**kwargs) for l in mb]
-        return image_grid([self.with_prompt(x) for x in [I]+X])
+        return self._image_grid([self.with_prompt(x) for x in [I]+X])
     
     @delegates(UnifiedStableDiffusionPipeline.generate)
     def generate_with_prompts(self, i, prompts, **kwargs):
         latents = self.saved[i]['latents']
         mb = master_bar(prompts)
         X = [self.gen(p, latents=latents, mb=mb, **kwargs) for p in mb]
-        return image_grid([self.with_prompt(x) for x in X])
+        return self._image_grid([self.with_prompt(x) for x in X])
     
     @delegates(UnifiedStableDiffusionPipeline.generate)
     def interpolate(self, i, j, num=20, prompt=None, **kwargs):
@@ -92,7 +90,7 @@ class EnhancedGenerator:
         L = [(l-l.mean())/l.std() for l in L]
         mb = master_bar(L)
         X = [self.gen(prompt, latents=l, mb=mb, **kwargs) for l in mb]
-        return image_grid([self.with_prompt(x) for x in X])
+        return self._image_grid([self.with_prompt(x) for x in X])
     
     @delegates(UnifiedStableDiffusionPipeline.generate)
     def modify_image(self, img, prompt=None, num=6, iterations=1, **kwargs):
@@ -105,7 +103,7 @@ class EnhancedGenerator:
         for i in range(1,iterations):
             print(f"Doing step {i+1}/{iterations}")
             X = [self.gen(prompt, img=x['sample'][0], **kwargs) for x in progress_bar(X)]
-        return image_grid([self.with_prompt(x) for x in X])
+        return self._image_grid([self.with_prompt(x) for x in X])
     
     @delegates(UnifiedStableDiffusionPipeline.inpaint)
     def inpaint(self, prompt, img, mask, num=1, **kwargs):
@@ -210,3 +208,36 @@ class EnhancedGenerator:
             if f.name.split('.')[-1] == 'pth':
                 if keyword is None or keyword.lower() in f.path.lower():
                     self.load(f.path)
+                    
+    def _image_grid(self,imgs):
+        if self.show_as_generated:
+            return
+        return image_grid(imgs)
+    
+    def _randlat(self, latents, noise):
+        factor = sqrt(prod(latents.shape)-1)
+        mu = torch.randn((1,),device=latents.device)/factor
+        sigma = torch.randn((1,),device=latents.device)/factor
+        
+        N = torch.randn_like(latents)*noise
+        return (N-N.mean())/(N.std()+sigma) + mu
+    
+    @property
+    def height(self):
+        return self.pipe.height
+
+    @height.setter
+    def height(self, h: int):
+        self.pipe.height = h
+    
+    @height.deleter
+    def height(self):
+        del self.pipe.height
+        
+    @property
+    def width(self):
+        return self.pipe.width
+
+    @width.setter
+    def width(self, w: int):
+        self.pipe.width = w
