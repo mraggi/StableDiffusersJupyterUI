@@ -38,52 +38,57 @@ def get_image_and_mask(img):
     return img, mask
 
 class EnhancedGenerator:
-    def __init__(self, pipe, height=512, width=768, savedir = "saved"):
+    def __init__(self, pipe, height=512, width=768, steps=90, guidance_scale=7.5, savedir = "saved"):
         self.pipe = pipe
         self.height = height
         self.width = width
+        self.steps = steps
+        self.guidance_scale = guidance_scale
+        
         self.saved = []
         
         self.savedir = Path(savedir)
         (self.savedir/"pth").mkdir(exist_ok=True, parents=True)
         self.show_as_generated = False   
         
-    @delegates(UnifiedStableDiffusionPipeline.generate)
+    @delegates(UnifiedStableDiffusionPipeline.txt2img)
     def gen(self, prompt, **kwargs):
         with torch.autocast("cuda"):
-            P = self.pipe.generate(prompt, **kwargs)
+            P = self.pipe.txt2img(prompt, **kwargs)
         P['prompt'] = prompt
         P['index'] = len(self.saved)
         self.saved.append(P)
+        if self.show_as_generated:
+            display(self.with_prompt(P))
         return P
     
-    @delegates(UnifiedStableDiffusionPipeline.generate)
+    @delegates(UnifiedStableDiffusionPipeline.txt2img)
     def generate_from_scratch(self, prompt, num=6, **kwargs):
         mb = master_bar(range(num))
         X = [self.gen(prompt, mb=mb, **kwargs) for _ in mb]
         
         return self._image_grid([self.with_prompt(x) for x in X])
     
-    @delegates(UnifiedStableDiffusionPipeline.generate)
+    @delegates(UnifiedStableDiffusionPipeline.txt2img)
     def generate_variants(self, i, noise=0.4, num=6, prompt = None, **kwargs):
         I = self.saved[i]
         latents = I['latents']
         if prompt is None: prompt = I['prompt']
         
-        lats = [self._randlat(latents,noise) for _ in range(num)]
+        lats = [self._randlat(latents=latents,noise=noise) for _ in range(num)]
         
         mb = master_bar(lats)
         X = [self.gen(prompt, latents=l, mb=mb,**kwargs) for l in mb]
         return self._image_grid([self.with_prompt(x) for x in [I]+X])
     
-    @delegates(UnifiedStableDiffusionPipeline.generate)
+    @delegates(UnifiedStableDiffusionPipeline.txt2img)
     def generate_with_prompts(self, i, prompts, **kwargs):
         latents = self.saved[i]['latents']
         mb = master_bar(prompts)
         X = [self.gen(p, latents=latents, mb=mb, **kwargs) for p in mb]
         return self._image_grid([self.with_prompt(x) for x in X])
     
-    @delegates(UnifiedStableDiffusionPipeline.generate)
+    @delegates(UnifiedStableDiffusionPipeline.txt2img)
     def interpolate(self, i, j, num=20, prompt=None, **kwargs):
         if prompt is None: prompt = self.saved[i]['prompt']
         Li, Lj = self.saved[i]['latents'], self.saved[j]['latents']
@@ -93,21 +98,30 @@ class EnhancedGenerator:
         X = [self.gen(prompt, latents=l, mb=mb, **kwargs) for l in mb]
         return self._image_grid([self.with_prompt(x) for x in X])
     
-    @delegates(UnifiedStableDiffusionPipeline.generate)
+    @delegates(UnifiedStableDiffusionPipeline.img2img)
+    def img2img(self, img, prompt, **kwargs):
+        with torch.autocast("cuda"):
+            P = self.pipe.img2img(prompt=prompt,img=img, **kwargs)
+        P['prompt'] = prompt
+        P['index'] = len(self.saved)
+        self.saved.append(P)
+        return P
+    
+    @delegates(UnifiedStableDiffusionPipeline.img2img)
     def modify_image(self, img, prompt=None, num=6, iterations=1, **kwargs):
         if isinstance(img,str) or isinstance(img,Path): img = Image.open(img)
         if isinstance(img,int):
             if prompt is None:
                 prompt = self.saved[img]['prompt']
             img = self.saved[img]['sample'][0]
-        X = [self.gen(prompt, img=img) for _ in progress_bar(range(num))]
+        X = [self.img2img(prompt=prompt, img=img, **kwargs) for _ in progress_bar(range(num))]
         for i in range(1,iterations):
             print(f"Doing step {i+1}/{iterations}")
-            X = [self.gen(prompt, img=x['sample'][0], **kwargs) for x in progress_bar(X)]
+            X = [self.img2img(prompt=prompt, img=x['sample'][0], **kwargs) for x in progress_bar(X)]
         return self._image_grid([self.with_prompt(x) for x in X])
     
     @delegates(UnifiedStableDiffusionPipeline.inpaint)
-    def inpaint(self, prompt, img, mask, num=1, **kwargs):
+    def inpaint(self, prompt, img, mask, num=1, mask_fill="Unchanged", **kwargs):
         if isinstance(img,np.ndarray):
             img = Image.fromarray(img)
         if isinstance(mask,np.ndarray):
@@ -116,7 +130,7 @@ class EnhancedGenerator:
         mb = master_bar(range(num))
         for _ in mb:
             with torch.autocast("cuda"):
-                P = self.pipe.inpaint(prompt, img=img, mask=mask, mb=mb, **kwargs)
+                P = self.pipe.inpaint(prompt, img=img, mask=mask, mb=mb, mask_fill=mask_fill, **kwargs)
             P['prompt'] = prompt
             P['index'] = len(self.saved)
             self.saved.append(P)
@@ -124,7 +138,8 @@ class EnhancedGenerator:
         return self[-num:]
     
     @delegates(UnifiedStableDiffusionPipeline.inpaint)
-    def inpaint_gui(self, img = None, steps=80, num=1, **kwargs):
+    def inpaint_gui(self, img = None, steps=None, num=1, **kwargs):
+        if steps is None: steps = self.pipe.steps
         prompt = ""
         if isinstance(img,int):
             prompt = self.saved[img]['prompt']
@@ -132,22 +147,27 @@ class EnhancedGenerator:
         if isinstance(img,str) or isinstance(img,Path):
             img = Image.open(img)
         with gr.Blocks() as block:
+            col = gr.Column()
             
-            def _inpaint_gui_out(self, imgmask, num, steps, prompt):
-                out = self.inpaint(prompt, img=imgmask['image'], mask=imgmask['mask'], num=num, steps=steps, **kwargs)
+            def _inpaint_gui_out(self, imgmask, num, steps, prompt, mask_fill):
+                col.update(visible=False)
+                img=imgmask['image']
+                mask=imgmask['mask']
+                
+                out = self.inpaint(prompt, img=img, mask=mask, num=num, steps=steps, mask_fill=mask_fill, **kwargs)
                 display(out)
-                block.clear()
+                
                 block.close()
                 return out
             
-            with gr.Column():
+            with col:
                 txt = gr.Textbox(label="Prompt", value=prompt)
                 inp = gr.Image(value=img, tool='sketch')
+                mask_fill = gr.Radio(["Unchanged", "Noise", "Black"],value="Unchanged",label="How to fill mask")
                 sld_num = gr.Slider(minimum=1,maximum=20,value=num,step=1,label="How many to generate")
                 sld_steps = gr.Slider(minimum=10,maximum=150,value=steps,step=1,label="Num inference steps")
-
                 btn = gr.Button("Submit")
-                btn.click(fn=lambda *args: _inpaint_gui_out(self, *args), inputs=[inp, sld_num, sld_steps, txt], outputs=None)
+                btn.click(fn=lambda *args: _inpaint_gui_out(self, *args), inputs=[inp, sld_num, sld_steps, txt, mask_fill], outputs=None)
         block.launch(server_port=3123)
     
     
@@ -230,10 +250,6 @@ class EnhancedGenerator:
     @height.setter
     def height(self, h: int):
         self.pipe.height = h
-    
-    @height.deleter
-    def height(self):
-        del self.pipe.height
         
     @property
     def width(self):
@@ -242,3 +258,19 @@ class EnhancedGenerator:
     @width.setter
     def width(self, w: int):
         self.pipe.width = w
+        
+    @property
+    def steps(self):
+        return self.pipe.steps
+
+    @steps.setter
+    def steps(self, s: int):
+        self.pipe.steps = s
+        
+    @property
+    def guidance_scale(self):
+        return self.pipe.guidance_scale
+
+    @guidance_scale.setter
+    def guidance_scale(self, g: int):
+        self.pipe.guidance_scale = g
