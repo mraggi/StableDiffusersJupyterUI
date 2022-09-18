@@ -14,10 +14,13 @@ from IPython.display import display
 from delegation import delegates
 from math import prod
 
-def image_grid(imgs):
+def image_grid(imgs, rows=None, cols=None):
     num = len(imgs)
-    cols = min(4,ceil(sqrt(num)))
-    rows = ceil(num/cols)
+    if rows is None and cols is None:
+        cols = min(4,ceil(sqrt(num)))
+        rows = ceil(num/cols)
+    if rows is None: rows = ceil(num/cols)
+    if cols is None: cols = ceil(num/rows)
     w, h = imgs[0].size
     grid = Image.new('RGB', size=(cols*w, rows*h))
     grid_w, grid_h = grid.size
@@ -36,6 +39,10 @@ def get_image_and_mask(img):
     img, mask = a[:,:,:3], a[:,:,3:]
     mask = mask.repeat(3,axis=2)
     return img, mask
+
+def _with_mean_std(X, mean=0., std=1.):
+    mu, sigma = X.mean(), X.std()
+    return (X-mu)*std/sigma + mean
 
 class EnhancedGenerator:
     def __init__(self, pipe, height=512, width=768, steps=90, guidance_scale=7.5, savedir = "saved"):
@@ -70,7 +77,7 @@ class EnhancedGenerator:
         return self._image_grid([self.with_prompt(x) for x in X])
     
     @delegates(UnifiedStableDiffusionPipeline.txt2img)
-    def generate_variants(self, i, noise=0.4, num=6, prompt = None, **kwargs):
+    def generate_variants(self, i, noise=0.3, num=6, prompt = None, **kwargs):
         I = self.saved[i]
         latents = I['latents']
         if prompt is None: prompt = I['prompt']
@@ -92,8 +99,15 @@ class EnhancedGenerator:
     def interpolate(self, i, j, num=20, prompt=None, **kwargs):
         if prompt is None: prompt = self.saved[i]['prompt']
         Li, Lj = self.saved[i]['latents'], self.saved[j]['latents']
-        L = [torch.lerp(Li,Lj,p.item()) for p in torch.linspace(0,1,num)]
-        L = [(l-l.mean())/l.std() for l in L]
+        mi, mj = Li.mean(), Lj.mean()
+        si, sj = Li.std(), Lj.std()
+        
+        L = [torch.lerp(Li,Lj,p) for p in torch.linspace(0,1,num)]
+        M = [torch.lerp(mi,mj,p) for p in torch.linspace(0,1,num)]
+        S = [torch.lerp(si,sj,p) for p in torch.linspace(0,1,num)]
+        
+        L = [_with_mean_std(l,m,s) for l,m,s in zip(L,M,S)]
+        
         mb = master_bar(L)
         X = [self.gen(prompt, latents=l, mb=mb, **kwargs) for l in mb]
         return self._image_grid([self.with_prompt(x) for x in X])
@@ -173,6 +187,7 @@ class EnhancedGenerator:
     
     
     def with_prompt(self, img, with_idx = True):
+        if isinstance(img,int): img = self.saved[img]
         prompt = img['prompt']
         idx = img['index']
         img = img['sample'][0].copy()
@@ -210,7 +225,7 @@ class EnhancedGenerator:
                 self.save(j)
         elif isinstance(i,int):
             I = self.saved[i]
-            prompt = I['prompt']
+            prompt = I['prompt'].replace("(","").replace(")","").replace("[","").replace("]","")[:30]
             fname = f"{prompt}_{i}_{random_string(4)}"
             torch.save(I,self.savedir/f'pth/{fname}.pth')
             img = I['sample'][0]
@@ -236,12 +251,16 @@ class EnhancedGenerator:
         return image_grid(imgs)
     
     def _randlat(self, latents, noise):
-        factor = sqrt(prod(latents.shape)-1)
-        mu = torch.randn((1,),device=latents.device)/factor
-        sigma = torch.randn((1,),device=latents.device)/factor
-        
         N = torch.randn_like(latents)*noise
-        return (N-N.mean())/(N.std()+sigma) + mu
+        return _with_mean_std(latents+N, mean=latents.mean(), std=latents.std())
+    
+    def remove(self, i: int):
+        self.saved[i] = self.saved[-1]
+        self.saved[i]['index'] = i
+        return self.saved.pop()
+    
+    def prompt(self, i):
+        return self.saved[i]['prompt']
     
     @property
     def height(self):
