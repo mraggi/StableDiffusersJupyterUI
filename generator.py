@@ -13,12 +13,37 @@ import gradio as gr
 from IPython.display import display
 from delegation import delegates
 from math import prod
+import os
+
+def separate_by_sizes(imgs):
+    imgs.sort(key=lambda x: 1000*x.width + x.height)
+    R,r = [],[]
+    prev_size = (imgs[0].height, imgs[0].width)
+    for i in imgs:
+        curr_size = (i.height, i.width)
+        if curr_size != prev_size:
+            R.append(r)
+            r = []
+            prev_size = curr_size
+        r.append(i)
+    R.append(r)
+    
+    return R
+
+def smart_image_grid(imgs, rows=None, cols=None):
+    imgs_by_sizes = separate_by_sizes(imgs)
+    for I in imgs_by_sizes:
+        display(image_grid(I,rows,cols))
 
 def image_grid(imgs, rows=None, cols=None):
     num = len(imgs)
     if rows is None and cols is None:
-        cols = min(4,ceil(sqrt(num)))
-        rows = ceil(num/cols)
+        if num == 3: rows,cols = 1,3
+        elif num == 4: rows,cols = 1,4
+        elif num == 5: rows,cols = 1,5
+        else:
+            cols = max(min(5,ceil(sqrt(num))),3)
+            rows = ceil(num/cols)
     if rows is None: rows = ceil(num/cols)
     if cols is None: cols = ceil(num/rows)
     w, h = imgs[0].size
@@ -112,6 +137,24 @@ class EnhancedGenerator:
         X = [self.gen(prompt, latents=l, mb=mb, **kwargs) for l in mb]
         return self._image_grid([self.with_prompt(x) for x in X])
     
+    @delegates(UnifiedStableDiffusionPipeline.txt2img)
+    def incrust(self, i, num=1, start = (0,0),**kwargs):
+        old_lat = self.saved[i]['latents']
+        prompt = self.saved[i]['prompt']
+        bs, c, oh, ow = old_lat.shape
+        h, w = self.height//8, self.width//8
+        if start == "center":
+            sh, sw = (h-oh)//2, (w-ow)//2
+        else:
+            sh, sw = start
+        X = []
+        mb = master_bar(range(num))
+        for _ in mb:
+            lat = torch.randn(bs, c, h, w)
+            lat[:,:,sh:sh+oh,sw:sw+ow] = old_lat
+            X += [self.gen(prompt,latents=lat,mb=mb,**kwargs)]
+        return image_grid([self.with_prompt(x) for x in X])
+    
     @delegates(UnifiedStableDiffusionPipeline.img2img)
     def img2img(self, img, prompt, **kwargs):
         with torch.autocast("cuda"):
@@ -202,6 +245,7 @@ class EnhancedGenerator:
         drawer.text((w//2, h-40), str(idx), font=font, fill=(255, 255, 0))
         return img
     
+    
     def get_images(self):
         return [x['sample'][0] for x in self.saved]
     
@@ -213,8 +257,10 @@ class EnhancedGenerator:
     def __getitem__(self, i):
         if isinstance(i,int):
             return self.view_img(i)
+        elif isinstance(i,list):
+            return smart_image_grid([self.with_prompt(self.saved[j]) for j in i])
         else:
-            return image_grid([self.with_prompt(a) for a in self.saved[i]])
+            return smart_image_grid([self.with_prompt(a) for a in self.saved[i]])
     
     def __len__(self):
         return len(self.saved)
@@ -225,19 +271,40 @@ class EnhancedGenerator:
                 self.save(j)
         elif isinstance(i,int):
             I = self.saved[i]
-            prompt = I['prompt'].replace("(","").replace(")","").replace("[","").replace("]","")[:30]
+            prompt = I['prompt'].replace("(","").replace(")","").replace("[","").replace("]","")[:128]
             fname = f"{prompt}_{i}_{random_string(4)}"
+            I['filename'] = fname
             torch.save(I,self.savedir/f'pth/{fname}.pth')
             img = I['sample'][0]
             img.save(self.savedir/f"{fname}.png")
         else:
             raise "Nope, only lists and ints"
     
-    def load(self, I):
-        if type(I) == str or type(I) == Path:
-            I = torch.load(I)
+    def load(self, fname):
+        if type(fname) == str or type(fname) == Path:
+            I = torch.load(fname)
+            if 'filename' not in I:
+                I['filename'] = Path(fname).stem
+                print(f"filename not found in index, so re-saving it as {fname}.")
+                torch.save(I,fname)
+        else:
+            I = fname
         I['index'] = len(self.saved)
+        
         self.saved.append(I)
+    
+    def delete(self, i):
+        if 'filename' not in self.saved[i]:
+            print("Can't delete, isn't saved")
+        else:
+            fname = self.saved[i]['filename']
+            pthfile = self.savedir/f'pth/{fname}.pth'
+            pngfile = self.savedir/f'{fname}.png'
+            print(f"Deleting {pthfile}")
+            print(f"Deleting {pngfile}")
+            pthfile.unlink()
+            pngfile.unlink()
+            
     
     def load_all(self, keyword=None):
         for f in os.scandir(self.savedir/"pth"):
@@ -258,6 +325,15 @@ class EnhancedGenerator:
         self.saved[i] = self.saved[-1]
         self.saved[i]['index'] = i
         return self.saved.pop()
+    
+    def keep_if(self, f):
+        n = len(self.saved)
+        for i in range(n-1,-1,-1):
+            if not f(self.saved[i]):
+                self.remove(i)
+    
+    def remove_if(self, f):
+        return self.keep_if(lambda x: not f(x))
     
     def prompt(self, i):
         return self.saved[i]['prompt']
