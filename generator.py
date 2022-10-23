@@ -1,14 +1,22 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision as tv
+to_pil = tv.transforms.ToPILImage()
+to_tensor = tv.transforms.ToTensor()
 from math import floor, ceil, sqrt
 from PIL import Image, ImageDraw, ImageFont
 import textwrap
 from fastprogress import progress_bar, master_bar
 from unified_pipeline import UnifiedStableDiffusionPipeline
+from inpaint_pipeline import UnifiedInpaintPipeline
 import random
 import os
 import pathlib
-import numpy as np
 from pathlib import Path
+
+import numpy as np
+
 import gradio as gr
 from IPython.display import display
 from delegation import delegates
@@ -16,7 +24,7 @@ from math import prod
 import os
 
 def separate_by_sizes(imgs):
-    imgs.sort(key=lambda x: 1000*x.width + x.height)
+    imgs.sort(key=lambda x: 10000*x.width + x.height)
     R,r = [],[]
     prev_size = (imgs[0].height, imgs[0].width)
     for i in imgs:
@@ -36,13 +44,19 @@ def smart_image_grid(imgs, rows=None, cols=None):
         display(image_grid(I,rows,cols))
 
 def image_grid(imgs, rows=None, cols=None):
+    bs = 30
+    if (len(imgs) > bs):
+        print(f"There are {len(imgs)} images. Breaking up in batches")
+        blocks = range(0,len(imgs),bs)
+        for b in blocks:
+            c = min(b + bs,len(imgs))
+            display(image_grid(imgs[b:c]))
+        return
     num = len(imgs)
     if rows is None and cols is None:
-        if num == 3: rows,cols = 1,3
-        elif num == 4: rows,cols = 1,4
-        elif num == 5: rows,cols = 1,5
+        if num <= 4: rows,cols = 1,num
         else:
-            cols = max(min(5,ceil(sqrt(num))),3)
+            cols = 3
             rows = ceil(num/cols)
     if rows is None: rows = ceil(num/cols)
     if cols is None: cols = ceil(num/rows)
@@ -58,20 +72,22 @@ def random_string(n):
     X = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     return "".join([random.choice(X) for _ in range(n)])
 
-def get_image_and_mask(img):
-    a = np.array(img).astype(np.uint8)
-    assert(a.shape[2] == 4)
-    img, mask = a[:,:,:3], a[:,:,3:]
-    mask = mask.repeat(3,axis=2)
-    return img, mask
+def mask_from_alpha(img):
+    if isinstance(img, str) or isinstance(img, Path): img = Image.open(img)
+    a = to_tensor(img)
+    assert(a.shape[0] == 4)
+    mask = a[3:]
+    return to_pil((mask < 0.8).float())
 
 def _with_mean_std(X, mean=0., std=1.):
     mu, sigma = X.mean(), X.std()
     return (X-mu)*std/sigma + mean
 
 class EnhancedGenerator:
-    def __init__(self, pipe, height=512, width=768, steps=90, guidance_scale=7.5, savedir = "saved"):
+    def __init__(self, pipe, inpaint_pipe=None, height=512, width=832, steps=90, guidance_scale=7.5, savedir = "saved"):
         self.pipe = pipe
+        self.device = pipe.device
+        self.inpaint_pipe = pipe if inpaint_pipe is None else inpaint_pipe
         self.height = height
         self.width = width
         self.steps = steps
@@ -85,9 +101,9 @@ class EnhancedGenerator:
         
     @delegates(UnifiedStableDiffusionPipeline.txt2img)
     def gen(self, prompt, **kwargs):
+        self._to_device()
         with torch.autocast("cuda"):
             P = self.pipe.txt2img(prompt, **kwargs)
-        P['prompt'] = prompt
         P['index'] = len(self.saved)
         self.saved.append(P)
         if self.show_as_generated:
@@ -102,15 +118,17 @@ class EnhancedGenerator:
         return self._image_grid([self.with_prompt(x) for x in X])
     
     @delegates(UnifiedStableDiffusionPipeline.txt2img)
-    def generate_variants(self, i, noise=0.3, num=6, prompt = None, **kwargs):
+    def generate_variants(self, i, noise=0.3, num=8, prompt = None, steps=None, guidance_scale=None, vary_mean_std = False, **kwargs):
         I = self.saved[i]
         latents = I['latents']
-        if prompt is None: prompt = I['prompt']
+        if prompt is None: prompt = self.prompt(i)
+        if steps is None: steps = self.get_steps(i)
+        if guidance_scale is None: guidance_scale = self.get_guidance_scale(i)
         
-        lats = [self._randlat(latents=latents,noise=noise) for _ in range(num)]
+        lats = [self._randlat(latents=latents,noise=noise,vary_mean_std=vary_mean_std) for _ in range(num)]
         
         mb = master_bar(lats)
-        X = [self.gen(prompt, latents=l, mb=mb,**kwargs) for l in mb]
+        X = [self.gen(prompt, latents=l, steps=steps, guidance_scale=guidance_scale, mb=mb, **kwargs) for l in mb]
         return self._image_grid([self.with_prompt(x) for x in [I]+X])
     
     @delegates(UnifiedStableDiffusionPipeline.txt2img)
@@ -156,46 +174,49 @@ class EnhancedGenerator:
         return image_grid([self.with_prompt(x) for x in X])
     
     @delegates(UnifiedStableDiffusionPipeline.img2img)
-    def img2img(self, img, prompt, **kwargs):
+    def img2img(self, img, prompt, mask = None, **kwargs):
+        self._to_device()
         with torch.autocast("cuda"):
-            P = self.pipe.img2img(prompt=prompt,img=img, **kwargs)
-        P['prompt'] = prompt
+            P = self.pipe.img2img(prompt=prompt, img=img, mask=mask, **kwargs)
         P['index'] = len(self.saved)
         self.saved.append(P)
         return P
     
     @delegates(UnifiedStableDiffusionPipeline.img2img)
-    def modify_image(self, img, prompt=None, num=6, iterations=1, **kwargs):
-        if isinstance(img,str) or isinstance(img,Path): img = Image.open(img)
+    def modify_image(self, img, prompt=None, num=6, **kwargs):
         if isinstance(img,int):
-            if prompt is None:
-                prompt = self.saved[img]['prompt']
+            if prompt is None: prompt = self.prompt(img)
             img = self.saved[img]['sample'][0]
-        X = [self.img2img(prompt=prompt, img=img, **kwargs) for _ in progress_bar(range(num))]
-        for i in range(1,iterations):
-            print(f"Doing step {i+1}/{iterations}")
-            X = [self.img2img(prompt=prompt, img=x['sample'][0], **kwargs) for x in progress_bar(X)]
+        mb = master_bar(range(num))
+        X = [self.img2img(prompt=prompt, img=img, mb=mb, **kwargs) for _ in mb]
         return self._image_grid([self.with_prompt(x) for x in X])
     
-    @delegates(UnifiedStableDiffusionPipeline.inpaint)
-    def inpaint(self, prompt, img, mask, num=1, mask_fill="Unchanged", **kwargs):
-        if isinstance(img,np.ndarray):
-            img = Image.fromarray(img)
-        if isinstance(mask,np.ndarray):
-            mask = Image.fromarray(mask)
+    #@delegates(UnifiedStableDiffusionPipeline.inpaint)
+    def inpaint(self, img, prompt = None, mask = None, num=1, **kwargs):
+        
+        if isinstance(img,int): 
+            if prompt is None: prompt = self.prompt(img)
+            img = self.__getitem__(img)
+        if isinstance(img,str) or isinstance(img,Path):
+            img = Image.open(img)
+        if isinstance(mask,str) or isinstance(mask,Path):
+            mask = Image.open(mask)
+        if mask is None:
+            mask = mask_from_alpha(img)
+            
+        self._to_device(False)
         
         mb = master_bar(range(num))
         for _ in mb:
             with torch.autocast("cuda"):
-                P = self.pipe.inpaint(prompt, img=img, mask=mask, mb=mb, mask_fill=mask_fill, **kwargs)
-            P['prompt'] = prompt
+                P = self.inpaint_pipe.inpaint(prompt, img=img, mask=mask, mb=mb,**kwargs)
             P['index'] = len(self.saved)
             self.saved.append(P)
         
         return self[-num:]
     
-    @delegates(UnifiedStableDiffusionPipeline.inpaint)
-    def inpaint_gui(self, img = None, steps=None, num=1, **kwargs):
+    #@delegates(UnifiedStableDiffusionPipeline.inpaint)
+    def inpaint_gui(self, img = None, steps=None, num=1, strength=0.7, **kwargs):
         if steps is None: steps = self.pipe.steps
         prompt = ""
         if isinstance(img,int):
@@ -206,12 +227,18 @@ class EnhancedGenerator:
         with gr.Blocks() as block:
             col = gr.Column()
             
-            def _inpaint_gui_out(self, imgmask, num, steps, prompt, mask_fill):
+            def _inpaint_gui_out(self, prompt, negative_prompt, imgmask, num, steps, strength, pipe):
+                if negative_prompt == "": negative_prompt = None
                 col.update(visible=False)
-                img=imgmask['image']
-                mask=imgmask['mask']
                 
-                out = self.inpaint(prompt, img=img, mask=mask, num=num, steps=steps, mask_fill=mask_fill, **kwargs)
+                img = Image.fromarray(imgmask['image'])
+                mask = Image.fromarray(imgmask['mask'])
+                
+                
+                if pipe == "Inpaint":
+                    out = self.inpaint(prompt=prompt, img=img, mask=mask, num=num, steps=steps, strength=strength, negative_prompt=negative_prompt, **kwargs)
+                else:
+                    out = self.modify_image(prompt=prompt, img=img, mask=mask, num=num, steps=steps, strength=strength, negative_prompt=negative_prompt, **kwargs)
                 display(out)
                 
                 block.close()
@@ -219,20 +246,23 @@ class EnhancedGenerator:
             
             with col:
                 txt = gr.Textbox(label="Prompt", value=prompt)
+                ntxt = gr.Textbox(label="Negative Prompt")
                 inp = gr.Image(value=img, tool='sketch')
-                mask_fill = gr.Radio(["Unchanged", "Noise", "Black"],value="Unchanged",label="How to fill mask")
-                sld_num = gr.Slider(minimum=1,maximum=20,value=num,step=1,label="How many to generate")
+                sld_num = gr.Slider(minimum=1,maximum=30,value=num,step=1,label="How many to generate")
                 sld_steps = gr.Slider(minimum=10,maximum=150,value=steps,step=1,label="Num inference steps")
+                sld_strength = gr.Slider(minimum=0,maximum=1,value=strength,step=0.05,label="Strength")
+                rd_pipe = gr.Radio(["Img2img", "Inpaint"],value="Img2img",label="Which pipeline to use?")
                 btn = gr.Button("Submit")
-                btn.click(fn=lambda *args: _inpaint_gui_out(self, *args), inputs=[inp, sld_num, sld_steps, txt, mask_fill], outputs=None)
+                btn.click(fn=lambda *args: _inpaint_gui_out(self, *args), inputs=[txt, inp, sld_num, sld_steps, sld_strength, rd_pipe], outputs=None)
         block.launch(server_port=3123)
-    
-    
     
     def with_prompt(self, img, with_idx = True):
         if isinstance(img,int): img = self.saved[img]
         prompt = img['prompt']
         idx = img['index']
+        steps = img['steps'] if 'steps' in img else ""
+        guidance_scale = img['guidance_scale'] if 'guidance_scale' in img else ""
+        
         img = img['sample'][0].copy()
         w,h = img.width, img.height
         drawer = ImageDraw.Draw(img)
@@ -243,6 +273,8 @@ class EnhancedGenerator:
             drawer.text((4, 4 + i*21), t, font=font, fill=(255, 0, 0, 200))
             
         drawer.text((w//2, h-40), str(idx), font=font, fill=(255, 255, 0))
+        drawer.text((20, h-40), str(steps), font=font, fill=(0, 255, 0))
+        drawer.text((w-50, h-40), f"{guidance_scale:.1f}", font=font, fill=(0, 0, 255))
         return img
     
     
@@ -256,6 +288,7 @@ class EnhancedGenerator:
     
     def __getitem__(self, i):
         if isinstance(i,int):
+            print(self.prompt(i))
             return self.view_img(i)
         elif isinstance(i,list):
             return smart_image_grid([self.with_prompt(self.saved[j]) for j in i])
@@ -277,6 +310,7 @@ class EnhancedGenerator:
             torch.save(I,self.savedir/f'pth/{fname}.pth')
             img = I['sample'][0]
             img.save(self.savedir/f"{fname}.png")
+            print(f"Saved file {fname}")
         else:
             raise "Nope, only lists and ints"
     
@@ -306,10 +340,10 @@ class EnhancedGenerator:
             pngfile.unlink()
             
     
-    def load_all(self, keyword=None):
+    def load_all(self, keywords=None):
         for f in os.scandir(self.savedir/"pth"):
             if f.name.split('.')[-1] == 'pth':
-                if keyword is None or keyword.lower() in f.path.lower():
+                if _are_in_prompt(keywords,f):
                     self.load(f.path)
                     
     def _image_grid(self,imgs):
@@ -317,9 +351,13 @@ class EnhancedGenerator:
             return
         return image_grid(imgs)
     
-    def _randlat(self, latents, noise):
+    def _randlat(self, latents, noise, vary_mean_std=False):
         N = torch.randn_like(latents)*noise
-        return _with_mean_std(latents+N, mean=latents.mean(), std=latents.std())
+        m, s = latents.mean(), latents.std()
+        if vary_mean_std:
+            m *= 1+torch.randn_like(m)*noise
+            s *= 1+torch.randn_like(m)*noise
+        return _with_mean_std(latents+N, mean=m, std=s)
     
     def remove(self, i: int):
         self.saved[i] = self.saved[-1]
@@ -332,11 +370,27 @@ class EnhancedGenerator:
             if not f(self.saved[i]):
                 self.remove(i)
     
+    def redo_indices(self):
+        for i, s in enumerate(self.saved):
+            s['index'] = i
+        
     def remove_if(self, f):
         return self.keep_if(lambda x: not f(x))
     
     def prompt(self, i):
         return self.saved[i]['prompt']
+    
+    def get_guidance_scale(self, i):
+        if 'guidance_scale' in self.saved[i]:
+            return self.saved[i]['guidance_scale']
+        else:
+            return 7.5
+    
+    def get_steps(self, i):
+        if 'steps' in self.saved[i]:
+            return self.saved[i]['steps']
+        else:
+            return 90
     
     @property
     def height(self):
@@ -369,3 +423,22 @@ class EnhancedGenerator:
     @guidance_scale.setter
     def guidance_scale(self, g: int):
         self.pipe.guidance_scale = g
+        
+    def _to_device(self, original_pipe=True):
+        if original_pipe:
+            if self.pipe.unet.device == self.device: return
+            self.inpaint_pipe.unet.to('cpu')
+            self.pipe.unet.to(self.device)
+        else:
+            if self.inpaint_pipe.unet.device == self.device: return
+            self.pipe.unet.to('cpu')
+            self.inpaint_pipe.unet.to(self.device)
+
+def _are_in_prompt(keywords, f):
+    if keywords is None: return True
+    if type(keywords) == str: keywords = [keywords]
+    prompt = torch.load(Path(f))['prompt']
+    for k in keywords:
+        if k.lower() not in prompt.lower():
+            return False
+    return True
