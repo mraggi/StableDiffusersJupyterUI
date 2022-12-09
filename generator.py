@@ -169,7 +169,7 @@ class EnhancedGenerator:
         mb = master_bar(range(num))
         for _ in mb:
             lat = torch.randn(bs, c, h, w)
-            lat[:,:,sh:sh+oh,sw:sw+ow] = old_lat
+            lat[:,:,sh:sh+oh,sw:sw+ow] = old_lat[:,:,:oh,:ow]
             X += [self.gen(prompt,latents=lat,mb=mb,**kwargs)]
         return image_grid([self.with_prompt(x) for x in X])
     
@@ -205,7 +205,8 @@ class EnhancedGenerator:
             mask = mask_from_alpha(img)
             
         self._to_device(False)
-        
+        print(f"self.pipe.device = {self.pipe.device}")
+        print(f"self.inpaint_pipe.device = {self.inpaint_pipe.device}")
         mb = master_bar(range(num))
         for _ in mb:
             with torch.autocast("cuda"):
@@ -227,15 +228,15 @@ class EnhancedGenerator:
         with gr.Blocks() as block:
             col = gr.Column()
             
-            def _inpaint_gui_out(self, prompt, negative_prompt, imgmask, num, steps, strength, pipe):
+            def _inpaint_gui_out(self, prompt, negative_prompt, img_mask, num, steps, strength, pipe_name):
                 if negative_prompt == "": negative_prompt = None
                 col.update(visible=False)
                 
-                img = Image.fromarray(imgmask['image'])
-                mask = Image.fromarray(imgmask['mask'])
+                img = Image.fromarray(img_mask['image'])
+                mask = Image.fromarray(img_mask['mask'])
                 
                 
-                if pipe == "Inpaint":
+                if pipe_name == "Inpaint":
                     out = self.inpaint(prompt=prompt, img=img, mask=mask, num=num, steps=steps, strength=strength, negative_prompt=negative_prompt, **kwargs)
                 else:
                     out = self.modify_image(prompt=prompt, img=img, mask=mask, num=num, steps=steps, strength=strength, negative_prompt=negative_prompt, **kwargs)
@@ -247,21 +248,21 @@ class EnhancedGenerator:
             with col:
                 txt = gr.Textbox(label="Prompt", value=prompt)
                 ntxt = gr.Textbox(label="Negative Prompt")
-                inp = gr.Image(value=img, tool='sketch')
+                img_mask = gr.Image(value=img, tool='sketch')
                 sld_num = gr.Slider(minimum=1,maximum=30,value=num,step=1,label="How many to generate")
                 sld_steps = gr.Slider(minimum=10,maximum=150,value=steps,step=1,label="Num inference steps")
                 sld_strength = gr.Slider(minimum=0,maximum=1,value=strength,step=0.05,label="Strength")
                 rd_pipe = gr.Radio(["Img2img", "Inpaint"],value="Img2img",label="Which pipeline to use?")
                 btn = gr.Button("Submit")
-                btn.click(fn=lambda *args: _inpaint_gui_out(self, *args), inputs=[txt, inp, sld_num, sld_steps, sld_strength, rd_pipe], outputs=None)
+                btn.click(fn=lambda *args: _inpaint_gui_out(self, *args), inputs=[txt, ntxt, img_mask, sld_num, sld_steps, sld_strength, rd_pipe], outputs=None)
         block.launch(server_port=3123)
     
     def with_prompt(self, img, with_idx = True):
         if isinstance(img,int): img = self.saved[img]
         prompt = img['prompt']
         idx = img['index']
-        steps = img['steps'] if 'steps' in img else ""
-        guidance_scale = img['guidance_scale'] if 'guidance_scale' in img else ""
+        steps = img['steps'] if 'steps' in img else 90
+        guidance_scale = img['guidance_scale'] if 'guidance_scale' in img else 7.5
         
         img = img['sample'][0].copy()
         w,h = img.width, img.height
@@ -428,11 +429,13 @@ class EnhancedGenerator:
         if original_pipe:
             if self.pipe.unet.device == self.device: return
             self.inpaint_pipe.unet.to('cpu')
+            self.inpaint_pipe.to('cpu')
             self.pipe.unet.to(self.device)
         else:
             if self.inpaint_pipe.unet.device == self.device: return
             self.pipe.unet.to('cpu')
             self.inpaint_pipe.unet.to(self.device)
+            pritn(f"self.device = {self.device} but ")
 
 def _are_in_prompt(keywords, f):
     if keywords is None: return True
